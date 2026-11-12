@@ -13,26 +13,7 @@ import (
 	"voice-timeline-renderer/internal/service"
 )
 
-func Run(ctx context.Context, workflow string) error {
-	harness, err := NewHarness()
-	if err != nil {
-		return err
-	}
-	defer harness.Close()
-
-	switch workflow {
-	case "ingest-audio-source":
-		return runIngest(ctx, harness)
-	case "compose-timeline":
-		return runCompose(ctx, harness)
-	case "render-mixdown":
-		return runRender(ctx, harness)
-	default:
-		return fmt.Errorf("unknown workflow %q", workflow)
-	}
-}
-
-func runIngest(ctx context.Context, harness *Harness) error {
+func runIngest(ctx context.Context, harness *Harness, report *RunReport) error {
 	wav, err := sineWAV(48000, 1, 250, 440, 0.4)
 	if err != nil {
 		return err
@@ -71,10 +52,42 @@ func runIngest(ctx context.Context, harness *Harness) error {
 	if status != 404 || missing.ID != "" {
 		return fmt.Errorf("failed source became visible: status=%d id=%s", status, missing.ID)
 	}
+
+	// Real publication-boundary fault: decoding, measurement, and staging all
+	// succeed; only the atomic commit of the source directory is sabotaged.
+	fault, err := armCommitFault(harness.dataDir, "sources")
+	if err != nil {
+		return report.Step("arm source commit fault", err)
+	}
+	faultAsset, faultStatus, faultBody, faultErr := harness.createSourceWithBody(ctx, "source_ingest_commit_fault", "commit fault take", wav)
+	restoreErr := fault.Restore()
+	if faultErr != nil {
+		return report.Step("source commit fault request", faultErr)
+	}
+	if stepErr := report.Step("source commit fault request", nil); stepErr != nil {
+		return stepErr
+	}
+	if restoreErr != nil {
+		return report.Step("restore source index after fault", restoreErr)
+	}
+	if faultStatus != 500 || failureCode(faultBody) != "storage_error" {
+		return fmt.Errorf("commit fault returned status=%d code=%s, want 500 storage_error",
+			faultStatus, failureCode(faultBody))
+	}
+	if faultAsset.ID != "" {
+		return fmt.Errorf("commit-faulted source returned metadata id=%q, want empty", faultAsset.ID)
+	}
+	faulted, status, err := harness.getSource(ctx, "source_ingest_commit_fault")
+	if err != nil {
+		return err
+	}
+	if status != 404 || faulted.ID != "" {
+		return fmt.Errorf("commit-faulted source became visible: status=%d id=%s", status, faulted.ID)
+	}
 	return nil
 }
 
-func runCompose(ctx context.Context, harness *Harness) error {
+func runCompose(ctx context.Context, harness *Harness, report *RunReport) error {
 	first, err := sineWAV(48000, 1, 300, 220, 0.35)
 	if err != nil {
 		return err
@@ -119,7 +132,7 @@ func runCompose(ctx context.Context, harness *Harness) error {
 	return nil
 }
 
-func runRender(ctx context.Context, harness *Harness) error {
+func runRender(ctx context.Context, harness *Harness, report *RunReport) error {
 	first, err := sineWAV(48000, 1, 400, 220, 0.25)
 	if err != nil {
 		return err
@@ -143,7 +156,7 @@ func runRender(ctx context.Context, harness *Harness) error {
 		return err
 	}
 	if status != 201 {
-		return fmt.Errorf("timeline setup returned status %d", status)
+		return fmt.Errorf("timeline setup returned status=%d", status)
 	}
 	job, status, err := harness.createRender(ctx, "render_mixdown_01", plan.ID)
 	if err != nil {
@@ -187,6 +200,44 @@ func runRender(ctx context.Context, harness *Harness) error {
 	}
 	if math.Abs(measured.PeakDBFS-(-1)) > 0.25 {
 		return fmt.Errorf("output peak %.3f dBFS does not meet -1 dBFS target", measured.PeakDBFS)
+	}
+
+	// Real publication-boundary fault: the job reaches finalizing and the
+	// output WAV plus receipt are fully staged, but the atomic publication
+	// rename is sabotaged. The job must land in a durable failed terminal
+	// state with no downloadable output.
+	fault, err := armCommitFault(harness.dataDir, "renders")
+	if err != nil {
+		return report.Step("arm render publish fault", err)
+	}
+	faultJob, faultStatus, faultBody, faultErr := harness.createRenderWithBody(ctx, "render_publish_fault_01", plan.ID)
+	restoreErr := fault.Restore()
+	if faultErr != nil {
+		return report.Step("render publish fault request", faultErr)
+	}
+	if stepErr := report.Step("render publish fault request", nil); stepErr != nil {
+		return stepErr
+	}
+	if restoreErr != nil {
+		return report.Step("restore render index after fault", restoreErr)
+	}
+	if faultStatus != 500 || failureCode(faultBody) != "storage_error" {
+		return fmt.Errorf("publish fault returned status=%d code=%s, want 500 storage_error",
+			faultStatus, failureCode(faultBody))
+	}
+	if faultJob.ID != "render_publish_fault_01" || faultJob.State != domain.RenderFailed {
+		return fmt.Errorf("publish fault job state=%q id=%q, want failed terminal job", faultJob.State, faultJob.ID)
+	}
+	if faultJob.Error == nil || faultJob.Error.Code != "storage_error" {
+		return fmt.Errorf("publish fault job error=%+v, want storage_error code", faultJob.Error)
+	}
+	if faultJob.Output != nil || faultJob.ReceiptDigest != "" {
+		return fmt.Errorf("failed publish job carries output metadata")
+	}
+	if outputStatus, _, err := harness.requestJSON(ctx, "GET", "/v1/renders/render_publish_fault_01/output", nil); err != nil {
+		return err
+	} else if outputStatus != 409 {
+		return fmt.Errorf("failed render output returned status=%d, want 409", outputStatus)
 	}
 	return nil
 }

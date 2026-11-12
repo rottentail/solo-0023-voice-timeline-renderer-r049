@@ -14,26 +14,39 @@ type failureEnvelope struct {
 	Job   *domain.RenderJob  `json:"job,omitempty"`
 }
 
+// createSourceWithBody returns the decoded asset (zero on failure), the HTTP
+// status, and the raw response body so failure-path checks can inspect the
+// stable error envelope.
+func (harness *Harness) createSourceWithBody(
+	ctx context.Context,
+	id string,
+	name string,
+	wav []byte,
+) (domain.SourceAsset, int, []byte, error) {
+	status, body, err := harness.requestJSON(ctx, "PUT", "/v1/sources/"+id, service.SourceWriteRequest{
+		Name:      name,
+		WAVBase64: base64.StdEncoding.EncodeToString(wav),
+	})
+	if err != nil {
+		return domain.SourceAsset{}, status, body, err
+	}
+	var asset domain.SourceAsset
+	if status == 200 || status == 201 {
+		if err := decodeBody(body, &asset); err != nil {
+			return domain.SourceAsset{}, status, body, err
+		}
+	}
+	return asset, status, body, nil
+}
+
 func (harness *Harness) createSource(
 	ctx context.Context,
 	id string,
 	name string,
 	wav []byte,
 ) (domain.SourceAsset, int, error) {
-	status, body, err := harness.requestJSON(ctx, "PUT", "/v1/sources/"+id, service.SourceWriteRequest{
-		Name:      name,
-		WAVBase64: base64.StdEncoding.EncodeToString(wav),
-	})
-	if err != nil {
-		return domain.SourceAsset{}, status, err
-	}
-	var asset domain.SourceAsset
-	if status == 200 || status == 201 {
-		if err := decodeBody(body, &asset); err != nil {
-			return domain.SourceAsset{}, status, err
-		}
-	}
-	return asset, status, nil
+	asset, status, _, err := harness.createSourceWithBody(ctx, id, name, wav)
+	return asset, status, err
 }
 
 func (harness *Harness) getSource(
@@ -51,6 +64,13 @@ func (harness *Harness) getSource(
 		}
 	}
 	return asset, status, nil
+}
+
+// getSourceStatus performs a read without requiring a success body, which the
+// reopen reader needs for 404 adjudications.
+func (harness *Harness) getSourceStatus(ctx context.Context, id string) (int, error) {
+	status, _, err := harness.requestJSON(ctx, "GET", "/v1/sources/"+id, nil)
+	return status, err
 }
 
 func (harness *Harness) createTimeline(
@@ -98,24 +118,48 @@ func (harness *Harness) getTimeline(
 	return plan, status, nil
 }
 
+func (harness *Harness) getTimelineStatus(ctx context.Context, id string) (int, error) {
+	status, _, err := harness.requestJSON(ctx, "GET", "/v1/timelines/"+id, nil)
+	return status, err
+}
+
 func (harness *Harness) createRender(
 	ctx context.Context,
 	id string,
 	timelineID string,
 ) (domain.RenderJob, int, error) {
+	job, status, _, err := harness.createRenderWithBody(ctx, id, timelineID)
+	return job, status, err
+}
+
+// createRenderWithBody also returns the raw response body so failure-path
+// checks can inspect the stable error envelope alongside the terminal job.
+func (harness *Harness) createRenderWithBody(
+	ctx context.Context,
+	id string,
+	timelineID string,
+) (domain.RenderJob, int, []byte, error) {
 	status, body, err := harness.requestJSON(ctx, "PUT", "/v1/renders/"+id, service.RenderWriteRequest{
 		TimelineID: timelineID,
 	})
 	if err != nil {
-		return domain.RenderJob{}, status, err
+		return domain.RenderJob{}, status, body, err
+	}
+	var envelope failureEnvelope
+	if status >= 400 {
+		if decodeErr := decodeBody(body, &envelope); decodeErr != nil {
+			return domain.RenderJob{}, status, body, decodeErr
+		}
+		if envelope.Job != nil {
+			return *envelope.Job, status, body, nil
+		}
+		return domain.RenderJob{}, status, body, nil
 	}
 	var job domain.RenderJob
-	if status == 200 || status == 201 {
-		if err := decodeBody(body, &job); err != nil {
-			return domain.RenderJob{}, status, err
-		}
+	if err := decodeBody(body, &job); err != nil {
+		return domain.RenderJob{}, status, body, err
 	}
-	return job, status, nil
+	return job, status, body, nil
 }
 
 func (harness *Harness) getRender(
@@ -133,6 +177,11 @@ func (harness *Harness) getRender(
 		}
 	}
 	return job, status, nil
+}
+
+func (harness *Harness) getRenderStatus(ctx context.Context, id string) (int, error) {
+	status, _, err := harness.requestJSON(ctx, "GET", "/v1/renders/"+id, nil)
+	return status, err
 }
 
 func (harness *Harness) getReceipt(

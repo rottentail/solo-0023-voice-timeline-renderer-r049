@@ -3,3 +3,5 @@
 .DS_Store
 .env
 *.tmp
+# Retained workflow-check run workspaces (failure evidence; never committed)
+.check-runs/

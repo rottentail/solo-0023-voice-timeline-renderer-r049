@@ -189,9 +189,55 @@ go run ./cmd/timelinecheck -workflow compose-timeline
 go run ./cmd/timelinecheck -workflow render-mixdown
 ```
 
-Each check creates an isolated temporary data directory, starts the real HTTP
-handler, sends generated WAV inputs, and verifies read-back or rendered output.
-The checks are bounded and do not require network access.
+Each check starts the real HTTP handler in front of the real local
+repository, sends generated WAV inputs, and verifies read-back or rendered
+output. The checks are bounded and do not require network access. No in-memory
+or mock repository is used, and production storage and rendering code is never
+replaced.
+
+### Durable run workspaces
+
+Every run gets its own uniquely named workspace under `.check-runs/`:
+
+```text
+.check-runs/<workflow>-<timestamp>-<random>/
+  data/        # the real repository: sources, timelines, jobs, renders, tmp
+  report.json  # steps, HTTP exchanges, adjudicated promises, disk snapshot
+```
+
+- Runs never share a workspace, so a later successful run cannot inherit
+  pollution from an earlier one.
+- A failed run is always retained, with its report and the complete repository
+  state, so the failing HTTP response and the on-disk facts can be reviewed
+  together. Add `-keep` to retain a passing run as well.
+- A passing run removes its own workspace unless `-keep` is set. Use
+  `-workspace <dir>` to choose a different workspace root.
+
+### Real publication-boundary faults
+
+In addition to the validation failures, two checks sabotage the real atomic
+publication boundary (the final directory rename inside `storage`), after
+decoding, rendering, and staging have already succeeded:
+
+- `ingest-audio-source` makes the source commit fail and asserts a `500
+  storage_error` response with no visible source and no staging leftover.
+- `render-mixdown` makes render artifact publication fail and asserts the job
+  reaches the durable `failed` terminal state with a stable error code and no
+  downloadable output.
+
+The sabotage is applied to check-owned workspace directories only and is
+restored before the run ends.
+
+### Reopen adjudication
+
+After the driving HTTP server stops, each check reopens the same data
+directory through a fresh repository, service, and server. The reader then
+adjudicates every success and failure promise from disk facts alone:
+committed sources, timelines, completed renders (job, receipt, and output),
+the terminal failed job, the absence of rejected records, and the cleanup of
+unpublished staging directories. Each verdict is recorded in `report.json` as
+a fulfilled or broken promise; a broken promise fails the run while retaining
+the evidence.
 
 ## Deferred test boundary
 
